@@ -33,6 +33,23 @@ def is_wsl() -> bool:
                                      if Path("/proc/version").exists() else "")).lower()
 
 
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+def detached_process_options() -> dict[str, int | bool]:
+    if is_windows():
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS}
+    return {"start_new_session": True}
+
+
+def windows_code_command(*arguments: str) -> list[str]:
+    command = shutil.which("code") or shutil.which("code.cmd") or "code"
+    if is_windows() and command.lower().endswith((".cmd", ".bat")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", command, *arguments]
+    return [command, *arguments]
+
+
 class WindowsInput:
     """Send Unicode keyboard input to the foreground Windows VS Code window."""
 
@@ -268,6 +285,10 @@ def create_output_file(workspace: str, source: Path, index: int) -> Path:
 
 
 def require_tools() -> None:
+    if is_windows():
+        if shutil.which("code") is None and shutil.which("code.cmd") is None:
+            raise RuntimeError("Could not find the VS Code command. Install VS Code and enable its command on PATH.")
+        return
     if is_wsl():
         if shutil.which("powershell.exe") is None and shutil.which("powershell") is None:
             raise RuntimeError("Could not find powershell.exe. Enable WSL interop to control Windows VS Code.")
@@ -367,13 +388,13 @@ def wait_for_editor_focus(window_id: str, timeout: float = 10) -> None:
 
 
 def launch_or_activate(editor: Editor, workspace: str, file_to_open: Path | None = None) -> str:
-    if is_wsl():
+    if is_wsl() or is_windows():
         if editor.name != "VS Code":
             raise RuntimeError("The Windows input bridge currently supports VS Code only; use --editor \"VS Code\".")
         # Open/activate the workspace first. The destination file is opened in
         # a separate, awaited step so typing cannot land in the previous tab.
-        subprocess.Popen([shutil.which("code") or "code", "--reuse-window", workspace],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen(windows_code_command("--reuse-window", workspace),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **detached_process_options())
         print("Activated the VS Code workspace; waiting for the destination file before typing.")
         return "windows-vscode"
     window = window_for(editor)
@@ -387,7 +408,7 @@ def launch_or_activate(editor: Editor, workspace: str, file_to_open: Path | None
             [executable, str(file_to_open or Path(workspace))],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            **detached_process_options(),
         )
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -407,9 +428,9 @@ def launch_or_activate(editor: Editor, workspace: str, file_to_open: Path | None
 def open_file_in_editor(
     editor: Editor, file_path: Path, windows_input: WindowsInput | None = None,
 ) -> str:
-    if is_wsl():
-        subprocess.Popen([shutil.which("code") or "code", "--reuse-window", str(file_path)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    if is_wsl() or is_windows():
+        subprocess.Popen(windows_code_command("--reuse-window", str(file_path)),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **detached_process_options())
         if windows_input:
             windows_input.wait_for_file_open(file_path)
         return "windows-vscode"
@@ -420,7 +441,7 @@ def open_file_in_editor(
         [executable, "--reuse-window", str(file_path)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        **detached_process_options(),
     )
     deadline = time.monotonic() + 20
     window = None
@@ -620,6 +641,13 @@ def activity_session(
     end_at = time.monotonic() + duration
     print(f"{editor.name} session: about {duration / 60:.1f} min")
     while time.monotonic() < end_at:
+        if windows_input:
+            windows_input.wait_until_focused()
+            windows_input.move_pointer()
+            if click and random.random() < 0.12:
+                windows_input.safe_click()
+            time.sleep(random.uniform(15, 55))
+            continue
         x, y = random_point(window_id)
         subprocess.run(
             ["xdotool", "mousemove", "--sync", str(x), str(y)],
@@ -680,8 +708,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    if not sys.platform.startswith("linux"):
-        print("This version targets Kali/Linux desktop sessions.", file=sys.stderr)
+    if not (sys.platform.startswith("linux") or is_windows()):
+        print("This version targets Windows and Kali/Linux desktop sessions.", file=sys.stderr)
         return 2
     args = parse_args()
     if is_wsl() and not args.source:
@@ -689,7 +717,7 @@ def main() -> int:
         return 2
     try:
         require_tools()
-        windows_input = WindowsInput() if is_wsl() else None
+        windows_input = WindowsInput() if (is_wsl() or is_windows()) else None
         if not windows_input:
             import pyautogui
     except (RuntimeError, ImportError) as exc:
@@ -698,6 +726,10 @@ def main() -> int:
             print("Install Python dependencies with: python -m pip install -r requirements.txt", file=sys.stderr)
         return 2
     except Exception as exc:
+        if is_windows():
+            print("Error: Could not start the Windows input bridge. Run this from an interactive desktop session with Windows PowerShell available.", file=sys.stderr)
+            print(f"Details: {exc}", file=sys.stderr)
+            return 2
         # pyautogui connects to X while importing (through mouseinfo), so a
         # stale DISPLAY or missing Xauthority file otherwise produces a long
         # traceback before the script can start.
